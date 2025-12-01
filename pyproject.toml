@@ -30,7 +30,7 @@ bert = [
 ]
 
 ml = [
-    "iai>=2.11.2",
+    "interpretableai>=2.11.2",
 ]
 
 optimization = [
