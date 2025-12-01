@@ -130,6 +130,9 @@ python scripts/prediction_modeling.py --target conversion --models lr oct
 
 # Use BERT embeddings
 python scripts/prediction_modeling.py --target conversion --embedding-method bert
+
+# On Engaging
+LD_LIBRARY_PATH=/orcd/software/community/001/pkg/julia/1.10.4/lib/julia/:"${LD_LIBRARY_PATH}" python scripts/prediction_modeling.py --target conversion --embedding-method bert
 ```
 
 Trains and compares:
