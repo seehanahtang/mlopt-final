@@ -87,7 +87,7 @@ def get_target(df, target='conversion'):
         raise ValueError(f"Unknown target: {target}")
 
 
-def train_linear_regression(X_train, y_train, X_test, y_test, target='conversion', seed=42):
+def train_linear_regression(X_train, y_train, X_test, y_test, target='conversion', embedding_method='tfidf', seed=42):
     """Train linear regression with feature selection."""
     print(f"\n--- Linear Regression ---")
     
@@ -107,18 +107,18 @@ def train_linear_regression(X_train, y_train, X_test, y_test, target='conversion
     
     # Save model
     lnr = grid_lr.get_learner()
-    model_path = f"models/lr_{target}.json"
+    model_path = f"models/lr_{embedding_method}_{target}.json"
     lnr.write_json(model_path)
     print(f"Model saved to {model_path}")
     
     return grid_lr, mse_test
 
 
-def train_optimal_cart(X_train, y_train, X_test, y_test, target='conversion', seed=42):
-    """Train Optimal Cart Trees."""
-    print(f"\n--- Optimal Cart Trees ---")
+def train_ort(X_train, y_train, X_test, y_test, target='conversion', embedding_method='tfidf', seed=42):
+    """Train Optimal Regression Tree."""
+    print(f"\n--- Optimal Regression Tree ---")
     
-    grid_oct = iai.GridSearch(
+    grid_ort = iai.GridSearch(
         iai.OptimalTreeRegressor(
             random_seed=seed,
             show_progress=False,  # <--- Disables the "inner" progress bar
@@ -128,25 +128,25 @@ def train_optimal_cart(X_train, y_train, X_test, y_test, target='conversion', se
         
     )
     
-    grid_oct.fit_cv(X_train, y_train, validation_criterion='mse', n_folds=5, verbose=True)
+    grid_ort.fit_cv(X_train, y_train, validation_criterion='mse', n_folds=5, verbose=True)
     
     # Evaluate on test set
-    mse_train = grid_oct.score(X_train, y_train, criterion='mse')
-    mse_test = grid_oct.score(X_test, y_test, criterion='mse')
+    mse_train = grid_ort.score(X_train, y_train, criterion='mse')
+    mse_test = grid_ort.score(X_test, y_test, criterion='mse')
     
     print(f"Train MSE: {mse_train:.4f}")
     print(f"Test MSE:  {mse_test:.4f}")
     
     # Save model
-    lnr = grid_oct.get_learner()
-    model_path = f"models/oct_{target}.json"
+    lnr = grid_ort.get_learner()
+    model_path = f"models/ort_{embedding_method}_{target}.json"
     lnr.write_json(model_path)
     print(f"Model saved to {model_path}")
     
-    return grid_oct, mse_test
+    return grid_ort, mse_test
 
 
-def train_random_forest(X_train, y_train, X_test, y_test, target='conversion', seed=42):
+def train_random_forest(X_train, y_train, X_test, y_test, target='conversion', embedding_method='tfidf', seed=42):
     """Train Random Forest."""
     print(f"\n--- Random Forest ---")
     
@@ -168,14 +168,14 @@ def train_random_forest(X_train, y_train, X_test, y_test, target='conversion', s
     
     # Save model
     lnr = grid_rf.get_learner()
-    model_path = f"models/rf_{target}.json"
+    model_path = f"models/rf_{embedding_method}_{target}.json"
     lnr.write_json(model_path)
     print(f"Model saved to {model_path}")
     
     return grid_rf, mse_test
 
 
-def train_xgboost(X_train, y_train, X_test, y_test, target='conversion', seed=42):
+def train_xgboost(X_train, y_train, X_test, y_test, target='conversion', embedding_method='tfidf', seed=42):
     """Train XGBoost."""
     print(f"\n--- XGBoost ---")
     
@@ -197,7 +197,7 @@ def train_xgboost(X_train, y_train, X_test, y_test, target='conversion', seed=42
     
     # Save model
     lnr = grid_xgb.get_learner()
-    model_path = f"models/xgb_{target}.json"
+    model_path = f"models/xgb_{embedding_method}_{target}.json"
     lnr.write_json(model_path)
     print(f"Model saved to {model_path}")
     
@@ -232,8 +232,8 @@ def main():
         '--models',
         type=str,
         nargs='+',
-        default=['lr', 'oct', 'rf', 'xgb'],
-        choices=['lr', 'oct', 'rf', 'xgb'],
+        default=['lr', 'ort', 'rf', 'xgb'],
+        choices=['lr', 'ort', 'rf', 'xgb'],
         help='Models to train (default: all)'
     )
     
@@ -267,19 +267,19 @@ def main():
         results = {}
         
         if 'lr' in args.models:
-            _, mse = train_linear_regression(X_train, y_train, X_test, y_test, args.target)
+            _, mse = train_linear_regression(X_train, y_train, X_test, y_test, args.target, args.embedding_method)
             results['LR'] = mse
         
-        if 'oct' in args.models:
-            _, mse = train_optimal_cart(X_train, y_train, X_test, y_test, args.target)
-            results['OCT'] = mse
+        if 'ort' in args.models:
+            _, mse = train_ort(X_train, y_train, X_test, y_test, args.target, args.embedding_method)
+            results['ORT'] = mse
         
         if 'rf' in args.models:
-            _, mse = train_random_forest(X_train, y_train, X_test, y_test, args.target)
+            _, mse = train_random_forest(X_train, y_train, X_test, y_test, args.target, args.embedding_method)
             results['RF'] = mse
         
         if 'xgb' in args.models:
-            _, mse = train_xgboost(X_train, y_train, X_test, y_test, args.target)
+            _, mse = train_xgboost(X_train, y_train, X_test, y_test, args.target, args.embedding_method)
             results['XGB'] = mse
         
         # Print summary
