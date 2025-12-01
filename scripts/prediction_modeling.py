@@ -29,6 +29,11 @@ try:
     # Check if running on Slurm cluster (Engaging cluster)
     if 'SLURM_NODEID' in os.environ:
         # Engaging cluster configuration
+        threads = os.getenv('SLURM_CPUS_PER_TASK') 
+        os.environ['JULIA_NUM_THREADS'] = threads
+        
+        print(f"Running with {threads} Julia threads.")
+        
         os.environ['IAI_JULIA'] = "/orcd/software/community/001/pkg/julia/1.10.4/bin/julia"
         os.environ['IAI_SYSTEM_IMAGE'] = os.path.expanduser("~/iai/sys.so")
         os.environ['IAI_DISABLE_COMPILED_MODULES'] = "true"
@@ -114,12 +119,16 @@ def train_optimal_cart(X_train, y_train, X_test, y_test, target='conversion', se
     print(f"\n--- Optimal Cart Trees ---")
     
     grid_oct = iai.GridSearch(
-        iai.OptimalTreeRegressor(random_seed=seed),
+        iai.OptimalTreeRegressor(
+            random_seed=seed,
+            show_progress=False,  # <--- Disables the "inner" progress bar
+        ),
         max_depth=[2, 4, 6, 8],
-        minbucket=[0.01, 0.02, 0.05]
+        minbucket=[0.01, 0.02, 0.05],
+        
     )
     
-    grid_oct.fit_cv(X_train, y_train, validation_criterion='mse', n_folds=5)
+    grid_oct.fit_cv(X_train, y_train, validation_criterion='mse', n_folds=5, verbose=True)
     
     # Evaluate on test set
     mse_train = grid_oct.score(X_train, y_train, criterion='mse')
