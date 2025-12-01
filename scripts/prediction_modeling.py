@@ -26,7 +26,16 @@ import numpy as np
 # IAI requires a valid license and must be installed separately.
 # Install with: pip install iai
 try:
-    os.environ['IAI_SYSTEM_IMAGE'] = "C:\\Users\\jsitu\\IAI\\sys.dll"
+    # Check if running on Slurm cluster (Engaging cluster)
+    if 'SLURM_NODEID' in os.environ:
+        # Engaging cluster configuration
+        os.environ['IAI_JULIA'] = "/orcd/software/community/001/pkg/julia/1.10.4/bin/julia"
+        os.environ['IAI_SYSTEM_IMAGE'] = os.path.expanduser("~/iai/sys.so")
+        os.environ['IAI_DISABLE_COMPILED_MODULES'] = "true"
+    else:
+        # Local machine configuration (Windows)
+        os.environ['IAI_SYSTEM_IMAGE'] = "C:\\Users\\jsitu\\IAI\\sys.dll"
+    
     from interpretableai import iai
 except ImportError:
     print("ERROR: IAI library not found. Install with: pip install iai")
