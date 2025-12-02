@@ -31,6 +31,7 @@ echo "Running with JULIA_NUM_THREADS=$JULIA_NUM_THREADS"
 
 # Run the script (single job, no array). -u prints output as it runs.
 echo "Running prediction_modeling.py"
-LD_LIBRARY_PATH=/orcd/software/community/001/pkg/julia/1.10.4/lib/julia/:"${LD_LIBRARY_PATH}" python -u scripts/prediction_modeling.py --target conversion --embedding-method bert
+LD_LIBRARY_PATH=/orcd/software/community/001/pkg/julia/1.10.4/lib/julia/:"${LD_LIBRARY_PATH}" python -u scripts/prediction_modeling.py --target clicks --embedding-method tfidf
+LD_LIBRARY_PATH=/orcd/software/community/001/pkg/julia/1.10.4/lib/julia/:"${LD_LIBRARY_PATH}" python -u scripts/prediction_modeling.py --target clicks --embedding-method bert
 
 echo "End: $(date)"
