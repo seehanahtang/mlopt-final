@@ -27,6 +27,7 @@ from utils import (
     prepare_train_test_split,
     save_outputs,
 )
+from utils.date_features import COURSE_START_DATES
 
 
 def main():
@@ -69,13 +70,10 @@ def main():
     print("=" * 70)
     
     try:
-        # Course start dates (fixed)
-        course_start_dts = ['2024-10-15', '2025-02-10', '2025-09-29', '2026-02-09']
-        
         # Pipeline
         kw_df = load_and_combine_keyword_data(args.data_dir)
         kw_df = format_keyword_data(kw_df)
-        kw_df = extract_date_features(kw_df, course_start_dts)
+        kw_df = extract_date_features(kw_df, COURSE_START_DATES)
         kw_df = filter_data_by_date(kw_df)
         merged_df = merge_with_ads_data(kw_df, f"{args.data_dir}/combined_kw_ads_data2.csv")
         cleaned_df = clean_ads_data(merged_df)

@@ -36,6 +36,7 @@ from .data_pipeline import (
     add_embeddings,
     prepare_train_test_split,
     save_outputs,
+    load_embeddings,
 )
 
 __all__ = [
@@ -61,4 +62,5 @@ __all__ = [
     'add_embeddings',
     'prepare_train_test_split',
     'save_outputs',
+    'load_embeddings',
 ]

@@ -301,7 +301,7 @@ def prepare_train_test_split(df, test_size=0.25, random_state=42):
 
 def save_outputs(df, df_train, df_test, embedding_method='tfidf', output_dir='data'):
     """
-    Save processed data to CSV files.
+    Save processed data to CSV files, including unique keyword embeddings.
     
     Args:
     - df (pd.DataFrame): Full processed data.
@@ -328,3 +328,57 @@ def save_outputs(df, df_train, df_test, embedding_method='tfidf', output_dir='da
     df_test.to_csv(test_output, index=False)
     print(f"  Saved: {train_output}")
     print(f"  Saved: {test_output}")
+    
+    # Extract and save unique keyword embeddings without NAs in embedding columns
+    embedding_prefix = embedding_method.lower()
+    embedding_cols = [col for col in df.columns if col.startswith(f'{embedding_prefix}_')]
+    
+    if embedding_cols:
+        # Get unique keywords with their embeddings, dropping rows with NaN in embedding columns
+        # Keep rows even if they have NAs in other columns
+        unique_kw_embeddings = df[['Keyword'] + embedding_cols].drop_duplicates(subset=['Keyword'])
+        unique_kw_embeddings = unique_kw_embeddings.dropna(subset=embedding_cols).reset_index(drop=True)
+        
+        embeddings_output = output_path / f'unique_keyword_embeddings_{embedding_method}.csv'
+        unique_kw_embeddings.to_csv(embeddings_output, index=False)
+        print(f"  Saved: {embeddings_output} ({len(unique_kw_embeddings)} rows)")
+    else:
+        print(f"  Warning: No embedding columns found for method '{embedding_method}'")
+
+
+def load_embeddings(embeddings_file, embedding_method='tfidf', keywords=None):
+    """
+    Load embeddings from file.
+    
+    Args:
+    - embeddings_file (str or Path): Path to CSV with keyword embeddings.
+    - embedding_method (str): 'tfidf' or 'bert'.
+    - keywords (list, optional): If provided, filter to only these keywords.
+    
+    Returns:
+    - embeddings_df (pd.DataFrame): DataFrame with columns ['Keyword', 'embedding_0', ...]
+                                   without any NaN values in embedding columns.
+    """
+    embeddings_file = Path(embeddings_file)
+    
+    if not embeddings_file.exists():
+        raise FileNotFoundError(f"Embeddings file not found: {embeddings_file}")
+    
+    print(f"Loading embeddings from {embeddings_file}...")
+    df = pd.read_csv(embeddings_file)
+    
+    # Get embedding column names (those starting with 'tfidf_' or 'bert_')
+    embedding_prefix = embedding_method.lower()
+    embedding_cols = [col for col in df.columns if col.startswith(f'{embedding_prefix}_')]
+    
+    # Drop rows with NaN in embedding columns
+    df_clean = df.dropna(subset=embedding_cols).reset_index(drop=True)
+    print(f"  Loaded {len(df_clean)} rows with complete embeddings")
+    
+    # Filter by keywords if provided
+    if keywords is not None:
+        keywords_set = set(keywords)
+        df_clean = df_clean[df_clean['Keyword'].isin(keywords_set)].reset_index(drop=True)
+        print(f"  Filtered to {len(df_clean)} keywords")
+    
+    return df_clean

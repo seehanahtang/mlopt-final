@@ -22,28 +22,14 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
-# Note: This script uses InterpretableAI (IAI) library.
-# IAI requires a valid license and must be installed separately.
-# Install with: pip install iai
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Import IAI with automatic configuration
 try:
-    # Check if running on Slurm cluster (Engaging cluster)
-    if 'SLURM_NODEID' in os.environ:
-        # Engaging cluster configuration
-        threads = os.getenv('SLURM_CPUS_PER_TASK') 
-        os.environ['JULIA_NUM_THREADS'] = threads
-        
-        print(f"Running with {threads} Julia threads.")
-        
-        os.environ['IAI_JULIA'] = "/orcd/software/community/001/pkg/julia/1.10.4/bin/julia"
-        os.environ['IAI_SYSTEM_IMAGE'] = os.path.expanduser("~/iai/sys.so")
-        os.environ['IAI_DISABLE_COMPILED_MODULES'] = "true"
-    else:
-        # Local machine configuration (Windows)
-        os.environ['IAI_SYSTEM_IMAGE'] = "C:\\Users\\jsitu\\IAI\\sys.dll"
-    
-    from interpretableai import iai
+    from utils.iai_setup import iai
 except ImportError:
-    print("ERROR: IAI library not found. Install with: pip install iai")
+    print("ERROR: Could not set up IAI. Install with: pip install iai")
     print("Note: IAI requires a valid license.")
     sys.exit(1)
 
