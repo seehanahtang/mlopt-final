@@ -58,12 +58,25 @@ def load_embeddings_data(keywords, embedding_method='bert', output_dir='data'):
     return embedding_df
 
 
-def load_models(embedding_method='bert', models_dir='models'):
-    """Load pre-trained prediction models based on embedding method."""
-    print(f"Loading models for embedding method '{embedding_method}'...")
+def load_models(embedding_method='bert', alg_conv='lr', alg_clicks='lr', models_dir='models'):
+    """Load pre-trained prediction models based on embedding method and algorithm type.
     
-    conversion_model = Path(models_dir) / f'lr_{embedding_method}_conversion.json'
-    clicks_model = Path(models_dir) / f'lr_{embedding_method}_clicks.json'
+    Args:
+        embedding_method: 'bert' or 'tfidf'
+        alg_conv: algorithm type for conversion model - 'lr' (linear regression), 'ort' (optimal regression tree), 
+                  'rf' (random forest), 'xgb' (xgboost)
+        alg_clicks: algorithm type for clicks model - same options as alg_conv
+        models_dir: directory containing model files
+    
+    Returns:
+        tuple of (conversion_model, clicks_model)
+    """
+    print(f"Loading models for embedding method '{embedding_method}'...")
+    print(f"  Conversion model: {alg_conv}")
+    print(f"  Clicks model: {alg_clicks}")
+    
+    conversion_model = Path(models_dir) / f'{alg_conv}_{embedding_method}_conversion.json'
+    clicks_model = Path(models_dir) / f'{alg_clicks}_{embedding_method}_clicks.json'
     
     if not conversion_model.exists():
         raise FileNotFoundError(f"Conversion model not found: {conversion_model}")
@@ -227,6 +240,18 @@ def create_feature_matrix(keyword_df, embedding_method='bert', target_day=None, 
     else:
         print(f"  Using date features from {filter_day.date()}")
     
+    # Extract the order information for rows that actually made it into the feature matrix
+    # (BEFORE dropping Day/Keyword columns so we still have access to them)
+    keyword_idx_list = []
+    region_list = []
+    match_list = []
+    
+    for _, row in result.iterrows():
+        kw_idx = keyword_df[keyword_df['Keyword'] == row['Keyword']].index[0]
+        keyword_idx_list.append(kw_idx)
+        region_list.append(row['Region'])
+        match_list.append(row['Match type'])
+    
     # Drop day column
     result = result.drop(columns=['Day', 'Keyword'])
 
@@ -247,17 +272,6 @@ def create_feature_matrix(keyword_df, embedding_method='bert', target_day=None, 
     
     print(f"  Final feature matrix shape: {result.shape}")
     print(f"  Columns: {result.columns.tolist()[:15]}...")
-    
-    # Extract the order information for later use
-    keyword_idx_list = []
-    region_list = []
-    match_list = []
-    
-    for _, row in combo_df.iterrows():
-        kw_idx = keyword_df[keyword_df['Keyword'] == row['Keyword']].index[0]
-        keyword_idx_list.append(kw_idx)
-        region_list.append(row['Region'])
-        match_list.append(row['Match type'])
     
     return result, keyword_idx_list, region_list, match_list
 
@@ -369,30 +383,165 @@ def optimize_bids(X, weights_dict, budget=68096.51, max_bid=100, n_active=14229)
         print(f"  Status: {model.status}")
         return model, b, z
 
+def embed_lr(model, lnr, y, X, b, target):
+    """
+    Embeds LR constraints with STRICT validation.
+    Raises ValueError if X is missing any column required by the weights.
+    """
+    
+    # --- 1. Get Weights & Constant ---
+    weights_tuple = lnr.get_prediction_weights()
+    
+    numeric_weights = {}
+    categorical_weights = {}
 
-def extract_solution(model, b, z, keyword_df, keyword_idx_list, region_list, match_list, X=None, weights_dict=None):
+    if isinstance(weights_tuple, tuple):
+        numeric_weights = weights_tuple[0]
+        if len(weights_tuple) > 1:
+            categorical_weights = weights_tuple[1]
+    else:
+        numeric_weights = weights_tuple
+        
+    const = lnr.get_prediction_constant()
+
+    # --- 2. Create Variables for THIS target ---
+    indices = [(target, i) for i in range(len(X))]
+    new_y = model.addVars(indices, vtype=GRB.CONTINUOUS, name=f'y_{target}', lb=-GRB.INFINITY)
+    y.update(new_y)
+    
+    # --- 3. Add Constraints ---
+    for i in range(len(X)):
+        
+        rhs_expr = const
+        
+        # A. Numeric Features (Strict Check)
+        for feature, coef in numeric_weights.items():
+            if feature == 'Avg_ CPC':
+                rhs_expr += coef * b[i]
+                continue
+
+            elif feature not in X.columns:
+                raise ValueError(f"Error: Numeric column '{feature}' is missing from X dataframe.")
+            
+            else:
+                rhs_expr += coef * X.iloc[i][feature]
+
+        # B. Categorical Features (Strict Check)
+        for feature, level_dict in categorical_weights.items():
+            for level_name, coef in level_dict.items():
+                
+                # Construct OHE name (Match type_Broad match)
+                ohe_col_name = f"{feature}_{level_name}"
+                
+                if ohe_col_name not in X.columns:
+                    raise ValueError(f"Error: One-Hot encoded column '{ohe_col_name}' is missing from X dataframe.")
+                
+                rhs_expr += coef * X.iloc[i][ohe_col_name]
+
+        model.addConstr(new_y[(target, i)] == rhs_expr, name=f"LR_constr_{target}_{i}")
+
+    return model
+
+def optimize_bids_embedded(X, lnr_conv, lnr_clicks, budget=400, max_bid=50.0, max_active=1000):
+    """Solve bid optimization problem using Gurobi with embedded LR constraints.
+    
+    Embeds linear regression predictions directly into the Gurobi model as constraints,
+    then optimizes bid allocations.
+    
+    Args:
+        X: Feature matrix (rows = keyword-region-match combos, columns = features)
+        lnr_conv: Trained linear regression model for conversion
+        lnr_clicks: Trained linear regression model for clicks
+        budget: Total budget for bids
+        max_bid: Maximum individual bid
+        max_active: Maximum number of active keywords
+    
+    Returns:
+        tuple of (model, b, z, y) where:
+        - model: Gurobi model object (solved)
+        - b: Bid decision variables (MVar)
+        - z: Binary active indicator variables (MVar)
+        - y: Tupledict with optimized prediction variables y[('conversion', i)] and y[('clicks', i)]
+    """
+    print(f"\nSolving bid optimization with embedded LR constraints...")
+    print(f"  Budget: ${budget:,.2f}")
+    print(f"  Max bid: ${max_bid:.2f}")
+    print(f"  Max active keywords: {max_active}")
+    print(f"  Keywords: {len(X)}")
+    
+    # Create model
+    model = gp.Model('bid_optimization')
+    model.setParam('OutputFlag', 1)  # Show solver output
+
+    y = gp.tupledict()  # Predicted conversion and clicks variables
+    b = model.addMVar(shape=len(X), lb=0, ub=max_bid, name='bid')  # bid amounts
+
+    # Embed LR constraints for both targets
+    embed_lr(model, lnr_conv, y, X, b, target='conversion')
+    embed_lr(model, lnr_clicks, y, X, b, target='clicks')
+    
+    # Objective: Maximize profit. Sum of y_conversion - y_clicks * bid
+    profit = gp.quicksum(
+        y[('conversion', i)] - y[('clicks', i)] * b[i]
+        for i in range(len(X))
+    )
+    
+    model.setObjective(profit, GRB.MAXIMIZE)
+    
+    # Constraints
+    # Budget constraint
+    model.addConstr(gp.quicksum(b) <= budget, name='budget')
+    
+    model.update()
+    model.write("my_model_debug.lp")
+    
+    # Optimize
+    model.setParam("NonConvex", 2)  # Due to y[clicks] * b (if substituted would be quadratic)
+    model.optimize()
+    
+    return model, b, y
+
+
+def extract_solution(model, b, y, keyword_df, keyword_idx_list, region_list, match_list, X=None, weights_dict=None):
     """Extract non-zero bids from solution with predictions."""
     b_vals = b.X
-    z_vals = z.X
-    
-    # Find active keywords
-    active_idx = np.where(z_vals >= 0.)[0]  # Select all # Binary threshol
     
     print(f"\nSolution Summary:")
-    print(f"  Active keywords: {len(active_idx)}")
     print(f"  Total spend: ${np.sum(b_vals):,.2f}")
     print(f"  Predicted profit: ${model.objVal:,.2f}")
     
     # Build result DataFrame
     bids_df = pd.DataFrame({
-        'bid': b_vals[active_idx],
-        'keyword': [keyword_df.iloc[keyword_idx_list[i]]['Keyword'] for i in active_idx],
-        'region': [region_list[i] for i in active_idx],
-        'match': [match_list[i] for i in active_idx],
+        'bid': b_vals,
+        'keyword': [keyword_df.iloc[keyword_idx_list[i]]['Keyword'] for i in range(len(b_vals))],
+        'region': [region_list[i] for i in range(len(b_vals))],
+        'match': [match_list[i] for i in range(len(b_vals))],
     })
     
-    # Add predictions if X and weights_dict provided
-    if X is not None and weights_dict is not None:
+    # Add predictions if y variables are available (from embedded LR)
+    if y is not None and len(y) > 0:
+        conv_preds = []
+        clicks_preds = []
+        profits = []
+        
+        for idx in range(len(b_vals)):
+            # Get y values directly from the optimized solution
+            conv_val = y[('conversion', idx)].X
+            clicks_val = y[('clicks', idx)].X
+            bid_val = b_vals[idx]
+            
+            # Profit is exactly as optimized: conversion - clicks * bid
+            profit = conv_val - clicks_val * bid_val
+            
+            conv_preds.append(conv_val)
+            clicks_preds.append(clicks_val)
+            profits.append(profit)
+        
+        bids_df['predicted_conv_value'] = conv_preds
+        bids_df['predicted_clicks'] = clicks_preds
+        bids_df['predicted_profit'] = profits
+    elif X is not None and weights_dict is not None:
+        # Fallback: compute from features and weights if y not available
         conv_const = weights_dict['conv_const']
         conv_weights = weights_dict['conv_weights']
         clicks_const = weights_dict['clicks_const']
@@ -407,29 +556,31 @@ def extract_solution(model, b, z, keyword_df, keyword_idx_list, region_list, mat
         clicks_preds = []
         profits = []
         
-        for i, idx in enumerate(active_idx):
+        for i, idx in enumerate(range(len(b_vals))):
             bid_val = b_vals[idx]
             
-            # Compute conversion value prediction (without clamping to match model)
-            conv_val = conv_const
+            # Compute base conversion value (features + constant, WITHOUT bid term yet)
+            conv_base = conv_const
             for feat_name, weight in conv_weights.items():
-                if feat_name in X.columns:
-                    conv_val += weight * X.loc[idx, feat_name]
-            # Add bid-weighted CPC impact to conversion
-            conv_val += conv_cpc_weight * bid_val
+                if feat_name not in ['Avg. CPC', 'Avg_ CPC'] and feat_name in X.columns:
+                    conv_base += weight * X.loc[idx, feat_name]
             
-            # Compute clicks prediction (without clamping to match model)
-            clicks_val = clicks_const
+            # Compute base clicks (features + constant, WITHOUT bid term yet)
+            clicks_base = clicks_const
             for feat_name, weight in clicks_weights.items():
-                if feat_name in X.columns:
-                    clicks_val += weight * X.loc[idx, feat_name]
-            # Add bid-weighted CPC impact to clicks
-            clicks_val += clicks_cpc_weight * bid_val
+                if feat_name not in ['Avg. CPC', 'Avg_ CPC'] and feat_name in X.columns:
+                    clicks_base += weight * X.loc[idx, feat_name]
             
-            # Calculate profit exactly as the optimizer did
-            # profit = conv_val + conv_cpc_weight * bid_val - (clicks_val + clicks_cpc_weight * bid_val) * bid_val
-            # But conv_val and clicks_val already include the bid terms, so:
-            # profit = conv_val - clicks_val * bid_val
+            # Now add bid terms properly:
+            # y_conv = conv_base + conv_cpc_weight * bid
+            # y_clicks = clicks_base + clicks_cpc_weight * bid
+            conv_val = conv_base + conv_cpc_weight * bid_val
+            clicks_val = clicks_base + clicks_cpc_weight * bid_val
+            
+            # Profit exactly matches optimizer objective:
+            # profit = y_conv - y_clicks * bid
+            #        = (conv_base + conv_cpc_weight * bid) - (clicks_base + clicks_cpc_weight * bid) * bid
+            #        = conv_base + conv_cpc_weight * bid - clicks_base * bid - clicks_cpc_weight * bid^2
             profit = conv_val - clicks_val * bid_val
             
             conv_preds.append(conv_val)
@@ -456,6 +607,20 @@ def main():
         default='bert',
         choices=['tfidf', 'bert'],
         help='Embedding method used for models (default: bert)'
+    )
+    parser.add_argument(
+        '--alg-conv',
+        type=str,
+        default='lr',
+        choices=['lr', 'ort', 'rf', 'xgb'],
+        help='Algorithm type for conversion model: lr (linear regression), ort (optimal tree), rf (random forest), xgb (xgboost) (default: lr)'
+    )
+    parser.add_argument(
+        '--alg-clicks',
+        type=str,
+        default='lr',
+        choices=['lr', 'ort', 'rf', 'xgb'],
+        help='Algorithm type for clicks model: lr (linear regression), ort (optimal tree), rf (random forest), xgb (xgboost) (default: lr)'
     )
     parser.add_argument(
         '--budget',
@@ -509,7 +674,7 @@ def main():
         print(f"Loaded {len(keyword_df)} keywords from {embeddings_file}")
         
         # Load models
-        lnr_conv, lnr_clicks = load_models(args.embedding_method, args.models_dir)
+        lnr_conv, lnr_clicks = load_models(args.embedding_method, args.alg_conv, args.alg_clicks, args.models_dir)
         
         # Extract weights
         weights_dict = extract_weights(
@@ -529,14 +694,15 @@ def main():
         )
         
         print(f"Feature matrix has {X.shape[1]} total features")
-        
-        # Optimize using ALL features from the model
-        model, b, z = optimize_bids(
+
+        # Optimize using embedded LR constraints
+        model, b, y = optimize_bids_embedded(
             X,
-            weights_dict,
+            lnr_conv,
+            lnr_clicks,
             budget=args.budget,
             max_bid=args.max_bid,
-            n_active=args.max_active
+            max_active=args.max_active
         )
         
         # Extract solution
@@ -545,7 +711,7 @@ def main():
             output_dir.mkdir(exist_ok=True)
             output_file = output_dir / f'optimized_bids_{args.embedding_method}.csv'
             
-            bids_df = extract_solution(model, b, z, keyword_df, kw_idx_list, region_list, match_list, X=X, weights_dict=weights_dict)
+            bids_df = extract_solution(model, b, y, keyword_df, kw_idx_list, region_list, match_list, X=X, weights_dict=weights_dict)
             
             # Save results
             bids_df.to_csv(output_file, index=False)
