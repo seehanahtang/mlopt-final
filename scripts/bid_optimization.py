@@ -462,6 +462,7 @@ def optimize_bids_embedded(X, lnr_conv, lnr_clicks, budget=400, max_bid=50.0):
     # Create model
     model = gp.Model('bid_optimization')
     model.setParam('OutputFlag', 1) 
+    model.setParam('TimeLimit', 60)
 
     # --- 0. Decision Variables ---
     
@@ -536,7 +537,7 @@ def optimize_bids_embedded(X, lnr_conv, lnr_clicks, budget=400, max_bid=50.0):
     # --- 5. Logical Dependency ---
     # Click Sensor: If g < 1, force z=0. If g >= 1, allow z=1.
     model.addConstr(g_eff <= M_d * z, name='ClickSensorBigM')
-    model.addConstr(z <= g_eff / 0.01, name='ClickSensorActivator')
+    model.addConstr(z <= g_eff, name='ClickSensorActivator')
     
     # Conversion Gate: No clicks (z=0) means no conversion (f=0)
     model.addConstr(f_eff <= M_c * z, name='ConversionGate')
@@ -709,7 +710,7 @@ def main():
         )
         
         # Extract solution
-        if model.status == 2:  # OPTIMAL
+        if model.status == 2 or model.status == 9:  # OPTIMAL or TIME_LIMIT
             output_dir = Path('opt_results')
             output_dir.mkdir(exist_ok=True)
             output_file = output_dir / f'optimized_bids_{args.embedding_method}.csv'
