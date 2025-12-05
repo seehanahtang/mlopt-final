@@ -39,9 +39,8 @@ except ImportError:
 try:
     from utils.iai_setup import iai
 except ImportError:
-    print("ERROR: Could not set up IAI. Install with: pip install iai")
-    print("Note: IAI requires a valid license.")
-    sys.exit(1)
+    print("WARNING: Could not set up IAI. Will load weights from CSV files instead.")
+    iai = None
 
 
 def load_embeddings_data(keywords, embedding_method='bert', output_dir='data'):
@@ -56,6 +55,135 @@ def load_embeddings_data(keywords, embedding_method='bert', output_dir='data'):
     )
     
     return embedding_df
+
+
+def load_weights_from_csv(embedding_method='bert', models_dir='models'):
+    """Load weights and constants from CSV files (no IAI required).
+    
+    Falls back to IAI if CSV files don't exist.
+    
+    Args:
+        embedding_method: 'bert' or 'tfidf'
+        models_dir: directory containing weight CSV files
+    
+    Returns:
+        dict with keys: 'conv_const', 'conv_weights', 'clicks_const', 'clicks_weights'
+    """
+    print(f"Loading weights for embedding method '{embedding_method}'...")
+    
+    models_dir = Path(models_dir)
+    
+    # Check if CSV files exist
+    conv_numeric_file = models_dir / f'weights_{embedding_method}_conversion_numeric.csv'
+    conv_const_file = models_dir / f'weights_{embedding_method}_conversion_constant.csv'
+    clicks_numeric_file = models_dir / f'weights_{embedding_method}_clicks_numeric.csv'
+    clicks_const_file = models_dir / f'weights_{embedding_method}_clicks_constant.csv'
+    
+    # If CSV files exist, load from them
+    if conv_numeric_file.exists() and conv_const_file.exists() and \
+       clicks_numeric_file.exists() and clicks_const_file.exists():
+        print(f"  Loading from CSV files...")
+        
+        conv_cat_file = models_dir / f'weights_{embedding_method}_conversion_categorical.csv'
+        clicks_cat_file = models_dir / f'weights_{embedding_method}_clicks_categorical.csv'
+        
+        # Load conversion numeric weights
+        conv_numeric_df = pd.read_csv(conv_numeric_file)
+        conv_weights = dict(zip(conv_numeric_df['feature'], conv_numeric_df['weight']))
+        
+        # Load conversion categorical weights if available
+        if conv_cat_file.exists():
+            conv_cat_df = pd.read_csv(conv_cat_file)
+            for _, row in conv_cat_df.iterrows():
+                feature = row['feature']
+                level = row['level']
+                weight = row['weight']
+                if feature not in conv_weights:
+                    conv_weights[feature] = {}
+                if not isinstance(conv_weights[feature], dict):
+                    # If already have numeric, convert to dict
+                    numeric_val = conv_weights[feature]
+                    conv_weights[feature] = {feature: numeric_val}
+                conv_weights[feature][level] = weight
+        
+        # Load conversion constant
+        conv_const = pd.read_csv(conv_const_file)['constant'].iloc[0]
+        
+        # Load clicks numeric weights
+        clicks_numeric_df = pd.read_csv(clicks_numeric_file)
+        clicks_weights = dict(zip(clicks_numeric_df['feature'], clicks_numeric_df['weight']))
+        
+        # Load clicks categorical weights if available
+        if clicks_cat_file.exists():
+            clicks_cat_df = pd.read_csv(clicks_cat_file)
+            for _, row in clicks_cat_df.iterrows():
+                feature = row['feature']
+                level = row['level']
+                weight = row['weight']
+                if feature not in clicks_weights:
+                    clicks_weights[feature] = {}
+                if not isinstance(clicks_weights[feature], dict):
+                    # If already have numeric, convert to dict
+                    numeric_val = clicks_weights[feature]
+                    clicks_weights[feature] = {feature: numeric_val}
+                clicks_weights[feature][level] = weight
+        
+        # Load clicks constant
+        clicks_const = pd.read_csv(clicks_const_file)['constant'].iloc[0]
+        
+        print(f"  Loaded from CSV files ✓")
+        return {
+            'conv_const': conv_const,
+            'conv_weights': conv_weights,
+            'clicks_const': clicks_const,
+            'clicks_weights': clicks_weights
+        }
+    
+    # If CSV files don't exist, fall back to IAI
+    else:
+        print(f"  CSV files not found, falling back to IAI...")
+        if iai is None:
+            raise FileNotFoundError(
+                f"CSV weight files not found and IAI not available. "
+                f"Please run 'python scratch.py' first to extract weights."
+            )
+        
+        # Load models using IAI
+        conversion_model = models_dir / f'lr_{embedding_method}_conversion.json'
+        clicks_model = models_dir / f'lr_{embedding_method}_clicks.json'
+        
+        if not conversion_model.exists():
+            raise FileNotFoundError(f"Conversion model not found: {conversion_model}")
+        if not clicks_model.exists():
+            raise FileNotFoundError(f"Clicks model not found: {clicks_model}")
+        
+        lnr_conv = iai.read_json(str(conversion_model))
+        lnr_clicks = iai.read_json(str(clicks_model))
+        
+        # Extract weights and constants using IAI
+        weights_conv_tuple = lnr_conv.get_prediction_weights()
+        weights_clicks_tuple = lnr_clicks.get_prediction_weights()
+        
+        if isinstance(weights_conv_tuple, tuple):
+            conv_weights = weights_conv_tuple[0]
+        else:
+            conv_weights = weights_conv_tuple
+        
+        if isinstance(weights_clicks_tuple, tuple):
+            clicks_weights = weights_clicks_tuple[0]
+        else:
+            clicks_weights = weights_clicks_tuple
+        
+        conv_const = lnr_conv.get_prediction_constant()
+        clicks_const = lnr_clicks.get_prediction_constant()
+        
+        print(f"  Loaded from IAI models ✓")
+        return {
+            'conv_const': conv_const,
+            'conv_weights': conv_weights,
+            'clicks_const': clicks_const,
+            'clicks_weights': clicks_weights
+        }
 
 
 def load_models(embedding_method='bert', alg_conv='lr', alg_clicks='lr', models_dir='models'):
@@ -383,70 +511,81 @@ def optimize_bids(X, weights_dict, budget=68096.51, max_bid=100, n_active=14229)
         print(f"  Status: {model.status}")
         return model, b, z
 
-def embed_lr(model, lnr, y, X, b, target):
+def embed_lr(model, weights, const, X, b, target):
     """
-    Embeds LR constraints with STRICT validation.
-    Raises ValueError if X is missing any column required by the weights.
+    Embeds linear regression constraints directly into Gurobi model.
+    Creates prediction variables and adds constraints linking them to features and bids.
+    
+    Args:
+        model: Gurobi model object
+        weights: Dictionary of feature weights (can include dict values for categorical features)
+        const: Constant term from the model
+        X: Feature matrix (pandas DataFrame)
+        b: Bid decision variables (Gurobi MVar)
+        target: Target name ('conversion' or 'clicks') for variable naming
+    
+    Returns:
+        tuple of (model, pred_vars) where pred_vars is list of prediction variables
     """
+    K = len(X)
+    pred_vars = []
     
-    # --- 1. Get Weights & Constant ---
-    weights_tuple = lnr.get_prediction_weights()
+    print(f"  Embedding {target} model constraints...")
     
-    numeric_weights = {}
-    categorical_weights = {}
-
-    if isinstance(weights_tuple, tuple):
-        numeric_weights = weights_tuple[0]
-        if len(weights_tuple) > 1:
-            categorical_weights = weights_tuple[1]
-    else:
-        numeric_weights = weights_tuple
+    # Create prediction variables for this target
+    for i in range(K):
+        # Create prediction variable (can be negative)
+        pred_var = model.addVar(lb=-GRB.INFINITY, name=f'{target}_pred_{i}')
+        pred_vars.append(pred_var)
         
-    const = lnr.get_prediction_constant()
-
-    # --- 2. Create Variables for THIS target ---
-    indices = [(target, i) for i in range(len(X))]
-    new_y = model.addVars(indices, vtype=GRB.CONTINUOUS, name=f'y_{target}', lb=-GRB.INFINITY)
-    y.update(new_y)
-    
-    # --- 3. Add Constraints ---
-    for i in range(len(X)):
+        # Build constraint expression: pred = const + weights·features + cpc_weight·bid
+        expr = const
         
-        rhs_expr = const
-        
-        # A. Numeric Features (Strict Check)
-        for feature, coef in numeric_weights.items():
-            if feature == 'Avg_ CPC':
-                rhs_expr += coef * b[i]
+        # Add feature weights
+        for feature, weight in weights.items():
+            # Skip CPC weight for now, handle it separately
+            if feature in ['Avg. CPC', 'Avg_ CPC']:
                 continue
-
-            elif feature not in X.columns:
-                raise ValueError(f"Error: Numeric column '{feature}' is missing from X dataframe.")
             
+            # Check if weight is a dict (categorical feature with one-hot encoding)
+            if isinstance(weight, dict):
+                # This is a categorical feature with multiple levels
+                for level_name, level_weight in weight.items():
+                    # Construct one-hot encoded column name
+                    ohe_col_name = f"{feature}_{level_name}"
+                    
+                    if ohe_col_name not in X.columns:
+                        raise ValueError(f"Error: One-hot encoded column '{ohe_col_name}' is missing from X dataframe for {target} model.")
+                    
+                    expr += level_weight * X.iloc[i][ohe_col_name]
             else:
-                rhs_expr += coef * X.iloc[i][feature]
-
-        # B. Categorical Features (Strict Check)
-        for feature, level_dict in categorical_weights.items():
-            for level_name, coef in level_dict.items():
+                # This is a numeric feature
+                if feature not in X.columns:
+                    raise ValueError(f"Error: Feature '{feature}' is missing from X dataframe for {target} model.")
                 
-                # Construct OHE name (Match type_Broad match)
-                ohe_col_name = f"{feature}_{level_name}"
-                
-                if ohe_col_name not in X.columns:
-                    raise ValueError(f"Error: One-Hot encoded column '{ohe_col_name}' is missing from X dataframe.")
-                
-                rhs_expr += coef * X.iloc[i][ohe_col_name]
+                expr += weight * X.iloc[i][feature]
+        
+        # Add CPC weight contribution (if it exists)
+        cpc_weight = weights.get('Avg. CPC', weights.get('Avg_ CPC', 0.0))
+        if cpc_weight != 0.0:
+            expr += cpc_weight * b[i]
+        
+        # Add constraint: pred_var == expr
+        model.addConstr(pred_var == expr, name=f'{target}_constr_{i}')
+    
+    return model, pred_vars
 
-        model.addConstr(new_y[(target, i)] == rhs_expr, name=f"LR_constr_{target}_{i}")
-
-    return model
-
-def optimize_bids_embedded(X, lnr_conv, lnr_clicks, budget=400, max_bid=50.0):
+def optimize_bids_embedded(X, weights_dict, budget=400, max_bid=50.0):
     """Solve bid optimization problem using Gurobi with embedded LR constraints.
     
     Includes ReLU logic for both Conversion and Clicks to handle negative predictions
     while preserving the ability for y=0 to force results to 0.
+    
+    Args:
+        X: Feature matrix
+        weights_dict: Dictionary with 'conv_const', 'conv_weights', 'clicks_const', 'clicks_weights'
+        budget: Total budget for bids
+        max_bid: Maximum individual bid
     """
     
     # --- Parameters ---
@@ -485,20 +624,22 @@ def optimize_bids_embedded(X, lnr_conv, lnr_clicks, budget=400, max_bid=50.0):
     g_rect = model.addMVar(shape=K, lb=0, ub=M_d, name='g_rect')
 
     # --- 1. Raw ML Predictions (Embedded) ---
-    raw_preds = gp.tupledict()
+    # Create tupledict to hold prediction variables
+    f_hat_vars = []
+    g_hat_vars = []
     
-    # Embed the linear regression constraints
-    # (Assuming embed_lr populates raw_preds with linear constraints linking to b and X)
-    embed_lr(model, lnr_conv, raw_preds, X, b, target='conversion')
-    embed_lr(model, lnr_clicks, raw_preds, X, b, target='clicks')
+    # Extract weights and constants
+    conv_const = weights_dict['conv_const']
+    conv_weights = weights_dict['conv_weights']
+    clicks_const = weights_dict['clicks_const']
+    clicks_weights = weights_dict['clicks_weights']
     
-    # Extract the raw prediction variables (can be negative)
-    f_hat_vars = [raw_preds[('conversion', i)] for i in range(K)]
-    g_hat_vars = [raw_preds[('clicks', i)] for i in range(K)]
+    # Create raw prediction variables and add constraints using embed_lr
+    model, f_hat_vars = embed_lr(model, conv_weights, conv_const, X, b, target='conversion')
+    model, g_hat_vars = embed_lr(model, clicks_weights, clicks_const, X, b, target='clicks')
     
-    # Create MVar wrappers for vector math (where needed)
-    g_hat = gp.MVar.fromlist(g_hat_vars) # Used in specific linear constraints if needed
-
+    model.update()
+    
     # --- Total Budget Constraint ---
     model.addConstr(gp.quicksum(b) <= budget, name='TotalBudget')
 
@@ -678,14 +819,10 @@ def main():
         keyword_df = pd.read_csv(str(embeddings_file))
         print(f"Loaded {len(keyword_df)} keywords from {embeddings_file}")
         
-        # Load models
-        lnr_conv, lnr_clicks = load_models(args.embedding_method, args.alg_conv, args.alg_clicks, args.models_dir)
-        
-        # Extract weights
-        weights_dict = extract_weights(
-            lnr_conv, lnr_clicks, 
-            embedding_method=args.embedding_method, 
-            n_embeddings=50
+        # Load weights from CSV files (no IAI required)
+        weights_dict = load_weights_from_csv(
+            embedding_method=args.embedding_method,
+            models_dir=args.models_dir
         )
         
         # Create feature matrix (includes all features and keyword values for target day)
@@ -701,10 +838,10 @@ def main():
         print(f"Feature matrix has {X.shape[1]} total features")
 
         # Optimize using embedded LR constraints
+        # Note: optimize_bids_embedded now works directly with weights_dict
         model, b, z, y, f_eff, g_eff = optimize_bids_embedded(
             X,
-            lnr_conv,
-            lnr_clicks,
+            weights_dict,
             budget=args.budget,
             max_bid=args.max_bid
         )
