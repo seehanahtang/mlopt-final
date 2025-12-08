@@ -58,7 +58,7 @@ def setup_iai():
 
 
 # Initialize on module import
-try:
-    iai = setup_iai()
-except ImportError:
-    sys.exit(1)
+# try:
+#     iai = setup_iai()
+# except ImportError:
+#     sys.exit(1)
