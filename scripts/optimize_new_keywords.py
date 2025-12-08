@@ -318,9 +318,15 @@ def main():
         default=50.0,
         help='Maximum individual bid (default: 50.0)'
     )
+    parser.add_argument(
+        '--target-day',
+        type=str,
+        required=True,
+        help='Target day for optimization (format: YYYY-MM-DD)'
+    )
+    
     args = parser.parse_args()
-    target_day = sys.argv[1]
-
+    target_day = args.target_day
     embedding_method = args.embedding_method
 
     print("=" * 70)
