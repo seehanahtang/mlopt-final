@@ -8,14 +8,14 @@ For the specified month (YYYY-MM), this script:
  - Loads model weights from `models/weights_{embedding}_*` CSVs
  - For each calendar day in the month:
      - Builds the feature matrix (using `create_feature_matrix` from `bid_optimization`) for that day
-     - Runs `optimize_bids` with budget = (total_cost_for_month / days_in_month)
-     - Selects top-10 bids (by bid amount) and computes expected daily profit = sum(pred_conv - bid * pred_clicks)
+     - Runs `optimize_bids_embedded` with budget = (total_cost_for_month / days_in_month)
+     - Saves all active bids and computes expected daily profit = sum(pred_conv - bid * pred_clicks)
  - Sums expected daily profit across the month to get `expected_profit_month`
  - Computes `actual_profit_month = total_conv_value_for_month - total_cost_for_month`
  - Prints and saves the difference: `expected_profit_month - actual_profit_month`
 
 Usage:
-    python3 scripts/month_top10_vs_actual.py --year-month 2024-11 --embedding-method bert
+    python3 scripts/monthly_optimization_backtest.py --year-month 2024-11 --embedding-method bert
 
 """
 import sys
@@ -100,12 +100,11 @@ def compute_model_predictions(X, weights_dict):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Per-day optimizations for a month and compare top-10 expected profit vs actual')
+    parser = argparse.ArgumentParser(description='Per-day optimizations for a month and compare expected profit vs actual')
     parser.add_argument('--year-month', type=parse_year_month, default='2025-10', help='Month to run in YYYY-MM')
     parser.add_argument('--embedding-method', type=str, default='bert', choices=['bert','tfidf'])
     parser.add_argument('--models-dir', type=str, default='models')
     parser.add_argument('--max-bid', type=float, default=50.0)
-    parser.add_argument('--top-k', type=int, default=10, help='Top-K bids to consider per day')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
 
@@ -157,7 +156,7 @@ def main():
 
     expected_profit_month = 0.0
     daily_details = []
-    topk_rows = []
+    all_bids = []
 
     # Iterate each calendar day
     for day in range(1, days_in_month+1):
@@ -200,20 +199,20 @@ def main():
         pred_conv = conv_preds + conv_cpc_w * b_vals
         pred_clicks = clicks_preds + clicks_cpc_w * b_vals
 
-        # Select top-K by bid amount
-        topk_idx = np.argsort(-b_vals)[:args.top_k]
-        # Compute expected profit for these top-K: sum(pred_conv - bid * pred_clicks)
-        day_expected_profit = float(np.sum(pred_conv[topk_idx] - b_vals[topk_idx] * pred_clicks[topk_idx]))
+        # Use all active bids (where bid > 0)
+        active_idx = np.where(b_vals > 0)[0]
+        # Compute expected profit for all active bids: sum(pred_conv - bid * pred_clicks)
+        day_expected_profit = float(np.sum(pred_conv[active_idx] - b_vals[active_idx] * pred_clicks[active_idx]))
         expected_profit_month += day_expected_profit
 
-        # Build and save top-K rows for this day
+        # Build and save all active bids for this day
         try:
-            kw_names = [keyword_df.iloc[kw_idx_list[i]]['Keyword'] for i in topk_idx]
+            kw_names = [keyword_df.iloc[kw_idx_list[i]]['Keyword'] for i in active_idx]
         except Exception:
-            kw_names = [keyword_df.iloc[kw_idx_list[i]]['Keyword'] if i < len(kw_idx_list) else '' for i in topk_idx]
+            kw_names = [keyword_df.iloc[kw_idx_list[i]]['Keyword'] if i < len(kw_idx_list) else '' for i in active_idx]
 
-        for idx_pos, i in enumerate(topk_idx):
-            topk_rows.append({
+        for idx_pos, i in enumerate(active_idx):
+            all_bids.append({
                 'day': str(target_day),
                 'rank': idx_pos + 1,
                 'keyword': kw_names[idx_pos],
@@ -230,16 +229,17 @@ def main():
             'rows': len(X),
             'budget': daily_budget,
             'budget_used': float(np.sum(b_vals)),
-            'topk_expected_profit': day_expected_profit,
-            'sum_pred_conv_topk': float(np.sum(pred_conv[topk_idx])),
-            'sum_pred_clicks_topk': float(np.sum(pred_clicks[topk_idx])),
+            'active_bids_count': len(active_idx),
+            'expected_profit': day_expected_profit,
+            'sum_pred_conv': float(np.sum(pred_conv[active_idx])),
+            'sum_pred_clicks': float(np.sum(pred_clicks[active_idx])),
         })
 
-        print(f"  Rows: {len(X)}, budget used: ${np.sum(b_vals):,.2f}, top-{args.top_k} expected profit: ${day_expected_profit:,.2f}")
+        print(f"  Rows: {len(X)}, budget used: ${np.sum(b_vals):,.2f}, active bids: {len(active_idx)}, expected profit: ${day_expected_profit:,.2f}")
 
     # After all days
     print("\n===== Monthly Summary =====")
-    print(f"Expected profit (sum of daily top-{args.top_k}): ${expected_profit_month:,.2f}")
+    print(f"Expected profit (sum of daily optimized bids): ${expected_profit_month:,.2f}")
     print(f"Actual profit (month): ${actual_profit_month:,.2f}")
     diff = expected_profit_month - actual_profit_month
     print(f"Difference (expected - actual): ${diff:,.2f}")
@@ -247,25 +247,25 @@ def main():
     # Save details
     out_dir = root / 'opt_results'
     out_dir.mkdir(exist_ok=True)
-    details_file = out_dir / f'month_top{args.top_k}_vs_actual_{args.embedding_method}_{year}-{month:02d}.csv'
+    details_file = out_dir / f'month_daily_summary_{args.embedding_method}_{year}-{month:02d}.csv'
     pd.DataFrame(daily_details).to_csv(details_file, index=False)
     print(f"Daily details saved to: {details_file}")
-    # Save top-K bids across the month
-    topk_file = out_dir / f'month_top{args.top_k}_bids_{args.embedding_method}_{year}-{month:02d}.csv'
-    if topk_rows:
-        pd.DataFrame(topk_rows).to_csv(topk_file, index=False)
-        print(f"Top-{args.top_k} bids (per day) saved to: {topk_file}")
+    # Save all bids across the month
+    bids_file = out_dir / f'month_all_bids_{args.embedding_method}_{year}-{month:02d}.csv'
+    if all_bids:
+        pd.DataFrame(all_bids).to_csv(bids_file, index=False)
+        print(f"All bids (per day) saved to: {bids_file}")
     else:
-        print("No top-K bids to save.")
+        print("No bids to save.")
 
     # Save a simple summary log with expected vs actual
-    summary_file = out_dir / f'month_top{args.top_k}_summary_{args.embedding_method}_{year}-{month:02d}.txt'
+    summary_file = out_dir / f'month_summary_{args.embedding_method}_{year}-{month:02d}.txt'
     with open(summary_file, 'w') as sf:
         sf.write(f"Month: {year}-{month:02d}\n")
         sf.write(f"Total cost (month): ${total_cost_month:,.2f}\n")
         sf.write(f"Total conversion value (month): ${total_conv_month:,.2f}\n")
         sf.write(f"Actual profit (month): ${actual_profit_month:,.2f}\n")
-        sf.write(f"Expected profit (sum of daily top-{args.top_k}): ${expected_profit_month:,.2f}\n")
+        sf.write(f"Expected profit (sum of daily optimized bids): ${expected_profit_month:,.2f}\n")
         sf.write(f"Difference (expected - actual): ${expected_profit_month - actual_profit_month:,.2f}\n")
         sf.write(f"Days in month: {days_in_month}\n")
         sf.write(f"Daily budget: ${daily_budget:,.2f}\n")
