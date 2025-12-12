@@ -31,7 +31,7 @@ Model saved to models/lr_conversion.json
 --- Optimal Cart Trees ---
 Train MSE: 0.0417
 Test MSE:  0.0520
-Model saved to models/oct_conversion.json
+Model saved to models/ort_conversion.json
 
 --- Random Forest ---
 Train MSE: 0.0437
@@ -46,12 +46,12 @@ Model saved to models/xgb_conversion.json
 ======================================================================
 Model Performance Summary (Test MSE)
 ======================================================================
-  OCT   : 0.0520
+  ORT   : 0.0520
   RF    : 0.0624
   XGB   : 0.0795
   LR    : 0.1067
 
-Best model: OCT
+Best model: ORT
 ======================================================================
 There is a more recent IAI release (v3.2.2) available.
 fold 1; train: 0.03469; valid: 0.05231; cp=>0.01021 minbucket=>0.01 max_depth=>2

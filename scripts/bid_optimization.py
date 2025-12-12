@@ -543,8 +543,9 @@ def embed_lr(model, weights, const, X, b, target):
         
         # Add feature weights
         for feature, weight in weights.items():
-            # Skip CPC weight for now, handle it separately
+            # Handle CPC weight specially - use decision variable b instead of feature matrix
             if feature in ['Avg. CPC', 'Avg_ CPC']:
+                expr += weight * b[i]
                 continue
             
             # Check if weight is a dict (categorical feature with one-hot encoding)
@@ -565,18 +566,175 @@ def embed_lr(model, weights, const, X, b, target):
                 
                 expr += weight * X.iloc[i][feature]
         
-        # Add CPC weight contribution (if it exists)
-        cpc_weight = weights.get('Avg. CPC', weights.get('Avg_ CPC', 0.0))
-        if cpc_weight != 0.0:
-            expr += cpc_weight * b[i]
-        
         # Add constraint: pred_var == expr
         model.addConstr(pred_var == expr, name=f'{target}_constr_{i}')
     
     return model, pred_vars
 
-def optimize_bids_embedded(X, weights_dict, budget=400, max_bid=50.0):
-    """Solve bid optimization problem using Gurobi with embedded LR constraints.
+def embed_ort(model, ort_model, X, b, target, M=1e5, save_dir=None):
+    """
+    Embeds Optimal Regression Tree (ORT) constraints directly into Gurobi model.
+    Creates prediction variables and leaf indicator variables, linking them to features and bids.
+    
+    Args:
+        model: Gurobi model object
+        ort_model: IAI ORT model object (from iai.read_json)
+        X: Feature matrix (pandas DataFrame)
+        b: Bid decision variables (Gurobi MVar)
+        target: Target name ('conversion' or 'clicks') for variable naming
+        M: Big-M parameter for indicator constraints (default: 1e5)
+        save_dir: (Optional) Directory to save the tree visualization HTML. If None, no save.
+
+    Returns:
+        tuple of (model, pred_vars) where pred_vars is list of prediction variables (one per row)
+    """
+    K = len(X)
+    pred_vars = []
+    
+    print(f"  Embedding {target} ORT model constraints...")
+    
+    # Save tree visualization if requested
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(exist_ok=True)
+        tree_file = save_dir / f'{target}_tree.html'
+        ort_model.write_html(str(tree_file))
+        print(f"    Saved {target} tree visualization to {tree_file}")
+    
+    # Extract tree structure from IAI model
+    num_nodes = ort_model.get_num_nodes()
+    leaf_nodes = []
+    
+    # Find all leaf nodes
+    for node_idx in range(1, num_nodes + 1):
+        if ort_model.is_leaf(node_index=node_idx):
+            leaf_nodes.append(node_idx)
+    
+    print(f"    Found {len(leaf_nodes)} leaf nodes")
+    
+    # Get leaf predictions (constants)
+    leaf_predictions = {}
+    for leaf_idx in leaf_nodes:
+        leaf_predictions[leaf_idx] = ort_model.get_regression_constant(node_index=leaf_idx)
+    
+    # Create prediction variables for each row (output of tree)
+    # Also create leaf indicator variables: l[i, leaf_id] = 1 if row i reaches leaf_id
+    for i in range(K):
+        pred_var = model.addVar(lb=-GRB.INFINITY, name=f'{target}_pred_{i}')
+        pred_vars.append(pred_var)
+        
+        # Create binary indicators for which leaf this row reaches
+        leaf_indicators = {}
+        for leaf_id in leaf_nodes:
+            leaf_indicators[leaf_id] = model.addVar(vtype=GRB.BINARY, name=f'{target}_leaf_{i}_{leaf_id}')
+        
+        # Constraint: exactly one leaf must be active for each row
+        model.addConstr(
+            gp.quicksum(leaf_indicators[leaf_id] for leaf_id in leaf_nodes) == 1,
+            name=f'{target}_one_leaf_{i}'
+        )
+        
+        # Add path constraints from root to leaves
+        # For each node, add constraint: if on this path, feature must satisfy split condition
+        for node_idx in range(1, num_nodes + 1):
+            if ort_model.is_leaf(node_index=node_idx):
+                continue  # Skip leaf nodes, no split
+            
+            # Get split information
+            split_feature = ort_model.get_split_feature(node_index=node_idx)
+            split_threshold = ort_model.get_split_threshold(node_index=node_idx)
+            lower_child = ort_model.get_lower_child(node_index=node_idx)
+            upper_child = ort_model.get_upper_child(node_index=node_idx)
+            
+            # Check if split is a hyperplane (weighted combination) or axis-aligned
+            is_hyperplane = ort_model.is_hyperplane_split(node_index=node_idx)
+            
+            if is_hyperplane:
+                # Hyperplane split: weighted combination of features
+                weights_dict = ort_model.get_split_weights(node_index=node_idx)[0]
+                
+                # Build expression: sum(weights[feat] * X[i, feat])
+                split_expr = 0
+                for feat_name, weight in weights_dict.items():
+                    # Handle CPC weight specially - use decision variable b instead of feature matrix
+                    if feat_name in ['Avg. CPC', 'Avg_ CPC']:
+                        split_expr += weight * b[i]
+                    else:
+                        if feat_name not in X.columns:
+                            raise ValueError(f"Feature '{feat_name}' not found in X for {target} ORT model")
+                        split_expr += weight * X.iloc[i][feat_name]
+            else:
+                # Axis-aligned split: single feature vs threshold
+                if split_feature in ['Avg. CPC', 'Avg_ CPC']:
+                    split_expr = b[i]
+                else:
+                    if split_feature not in X.columns:
+                        raise ValueError(f"Feature '{split_feature}' not found in X for {target} ORT model")
+                    split_expr = X.iloc[i][split_feature]
+            
+            # For leaves reachable via lower_child (feature <= threshold):
+            # Add constraint that if we're in a leaf reachable via lower_child, then split_expr <= threshold
+            lower_leaves = _get_descendant_leaves(lower_child, ort_model, leaf_nodes)
+            if lower_leaves:
+                model.addConstr(
+                    split_expr <= split_threshold + M * (1 - gp.quicksum(leaf_indicators[leaf_id] for leaf_id in lower_leaves)),
+                    name=f'{target}_lower_split_{i}_{node_idx}'
+                )
+            
+            # For leaves reachable via upper_child (feature > threshold):
+            # Add constraint that if we're in a leaf reachable via upper_child, then split_expr > threshold
+            upper_leaves = _get_descendant_leaves(upper_child, ort_model, leaf_nodes)
+            if upper_leaves:
+                model.addConstr(
+                    split_expr >= split_threshold + 1e-6 - M * (1 - gp.quicksum(leaf_indicators[leaf_id] for leaf_id in upper_leaves)),
+                    name=f'{target}_upper_split_{i}_{node_idx}'
+                )
+        
+        # Link prediction variable to leaf predictions
+        # pred_var = sum(leaf_predictions[leaf] * leaf_indicator[leaf])
+        model.addConstr(
+            pred_var == gp.quicksum(leaf_predictions[leaf_id] * leaf_indicators[leaf_id] for leaf_id in leaf_nodes),
+            name=f'{target}_prediction_{i}'
+        )
+    
+    return model, pred_vars
+
+
+def _get_descendant_leaves(node_idx, ort_model, all_leaves):
+    """
+    Get all leaf descendants of a given node.
+    
+    Args:
+        node_idx: Node index to start from
+        ort_model: IAI ORT model
+        all_leaves: List of all leaf node indices
+    
+    Returns:
+        List of leaf indices that are descendants of node_idx
+    """
+    if node_idx in all_leaves:
+        return [node_idx]
+    
+    if ort_model.is_leaf(node_index=node_idx):
+        return [node_idx]
+    
+    descendants = []
+    lower_child = ort_model.get_lower_child(node_index=node_idx)
+    upper_child = ort_model.get_upper_child(node_index=node_idx)
+    
+    if lower_child is not None:
+        descendants.extend(_get_descendant_leaves(lower_child, ort_model, all_leaves))
+    if upper_child is not None:
+        descendants.extend(_get_descendant_leaves(upper_child, ort_model, all_leaves))
+    
+    return descendants
+
+def optimize_bids_embedded(X, weights_dict, budget=400, max_bid=50.0, conv_model=None, clicks_model=None):
+    """Solve bid optimization problem using Gurobi with embedded ML model constraints.
+    
+    Supports embedding of:
+    - Linear Regression (LR): via weights_dict with constants and weights
+    - Optimal Regression Trees (ORT): via conv_model and clicks_model IAI objects
     
     Includes ReLU logic for both Conversion and Clicks to handle negative predictions
     while preserving the ability for y=0 to force results to 0.
@@ -586,6 +744,11 @@ def optimize_bids_embedded(X, weights_dict, budget=400, max_bid=50.0):
         weights_dict: Dictionary with 'conv_const', 'conv_weights', 'clicks_const', 'clicks_weights'
         budget: Total budget for bids
         max_bid: Maximum individual bid
+        conv_model: (Optional) IAI ORT model for conversion. If provided, uses ORT instead of LR
+        clicks_model: (Optional) IAI ORT model for clicks. If provided, uses ORT instead of LR
+    
+    Returns:
+        tuple of (model, b, z, y, f_eff, g_eff)
     """
     
     # --- Parameters ---
@@ -594,7 +757,20 @@ def optimize_bids_embedded(X, weights_dict, budget=400, max_bid=50.0):
     M_c = 40000   # Max potential conversion value (Big-M for f)
     K = len(X)    # Number of items
 
-    print(f"\nSolving bid optimization with embedded LR constraints...")
+    # Determine which models are being used
+    use_ort_conv = conv_model is not None
+    use_ort_clicks = clicks_model is not None
+    
+    model_type_str = ""
+    if use_ort_conv or use_ort_clicks:
+        if use_ort_conv and use_ort_clicks:
+            model_type_str = "ORT"
+        else:
+            model_type_str = f"{'ORT' if use_ort_conv else 'LR'} (conversion) + {'ORT' if use_ort_clicks else 'LR'} (clicks)"
+    else:
+        model_type_str = "LR"
+    
+    print(f"\nSolving bid optimization with embedded {model_type_str} constraints...")
     print(f"  Budget: ${budget:,.2f}")
     print(f"  Keywords: {K}")
 
@@ -628,15 +804,28 @@ def optimize_bids_embedded(X, weights_dict, budget=400, max_bid=50.0):
     f_hat_vars = []
     g_hat_vars = []
     
-    # Extract weights and constants
-    conv_const = weights_dict['conv_const']
-    conv_weights = weights_dict['conv_weights']
-    clicks_const = weights_dict['clicks_const']
-    clicks_weights = weights_dict['clicks_weights']
+    # Create trees directory for ORT visualization
+    trees_dir = Path('ort_trees') if (use_ort_conv or use_ort_clicks) else None
     
-    # Create raw prediction variables and add constraints using embed_lr
-    model, f_hat_vars = embed_lr(model, conv_weights, conv_const, X, b, target='conversion')
-    model, g_hat_vars = embed_lr(model, clicks_weights, clicks_const, X, b, target='clicks')
+    # Embed conversion model
+    if use_ort_conv:
+        # Use ORT model
+        model, f_hat_vars = embed_ort(model, conv_model, X, b, target='conversion', save_dir=trees_dir)
+    else:
+        # Use LR model
+        conv_const = weights_dict['conv_const']
+        conv_weights = weights_dict['conv_weights']
+        model, f_hat_vars = embed_lr(model, conv_weights, conv_const, X, b, target='conversion')
+    
+    # Embed clicks model
+    if use_ort_clicks:
+        # Use ORT model
+        model, g_hat_vars = embed_ort(model, clicks_model, X, b, target='clicks', save_dir=trees_dir)
+    else:
+        # Use LR model
+        clicks_const = weights_dict['clicks_const']
+        clicks_weights = weights_dict['clicks_weights']
+        model, g_hat_vars = embed_lr(model, clicks_weights, clicks_const, X, b, target='clicks')
     
     model.update()
     
@@ -690,9 +879,25 @@ def optimize_bids_embedded(X, weights_dict, budget=400, max_bid=50.0):
 
     model.setObjective(total_revenue - total_cost, GRB.MAXIMIZE)
 
+    # --- Save Model Formulation ---
+    model_dir = Path('model_formulations')
+    model_dir.mkdir(exist_ok=True)
+    
+    model.update()
+    
+    # Determine model type string for filename
+    if use_ort_conv or use_ort_clicks:
+        model_type_str = f"{('ort' if use_ort_conv else 'lr')}_{'ort' if use_ort_clicks else 'lr'}"
+    else:
+        model_type_str = "lr_lr"
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    lp_file = model_dir / f'bid_optimization_{model_type_str}_{timestamp}.lp'
+    model.write(str(lp_file))
+    print(f"\n  Model formulation saved to {lp_file}")
+    
     # --- Optimize ---
     model.setParam("NonConvex", 2) # Allow quadratic objective
-    model.update()
     model.optimize()
 
     return model, b, z, y, f_eff, g_eff
@@ -763,14 +968,14 @@ def main():
     parser.add_argument(
         '--alg-conv',
         type=str,
-        default='lr',
+        default='lr',# 'ort',#
         choices=['lr', 'ort', 'rf', 'xgb'],
         help='Algorithm type for conversion model: lr (linear regression), ort (optimal tree), rf (random forest), xgb (xgboost) (default: lr)'
     )
     parser.add_argument(
         '--alg-clicks',
         type=str,
-        default='lr',
+        default='lr', # 'ort', #
         choices=['lr', 'ort', 'rf', 'xgb'],
         help='Algorithm type for clicks model: lr (linear regression), ort (optimal tree), rf (random forest), xgb (xgboost) (default: lr)'
     )
@@ -837,20 +1042,47 @@ def main():
         
         print(f"Feature matrix has {X.shape[1]} total features")
 
-        # Optimize using embedded LR constraints
-        # Note: optimize_bids_embedded now works directly with weights_dict
+        # Load ORT models if requested for specific targets
+        conv_model = None
+        clicks_model = None
+        
+        if args.alg_conv == 'ort':
+            if iai is None:
+                raise RuntimeError("IAI is required for ORT models. Please install IAI or use LR (default).")
+            
+            conversion_model_path = Path(args.models_dir) / f'ort_{args.embedding_method}_conversion.json'
+            if not conversion_model_path.exists():
+                raise FileNotFoundError(f"ORT conversion model not found: {conversion_model_path}")
+            conv_model = iai.read_json(str(conversion_model_path))
+            print(f"  Loaded ORT conversion model from {conversion_model_path}")
+        
+        if args.alg_clicks == 'ort':
+            if iai is None:
+                raise RuntimeError("IAI is required for ORT models. Please install IAI or use LR (default).")
+            
+            clicks_model_path = Path(args.models_dir) / f'ort_{args.embedding_method}_clicks.json'
+            if not clicks_model_path.exists():
+                raise FileNotFoundError(f"ORT clicks model not found: {clicks_model_path}")
+            clicks_model = iai.read_json(str(clicks_model_path))
+            print(f"  Loaded ORT clicks model from {clicks_model_path}")
+
+        # Optimize using embedded ML constraints
         model, b, z, y, f_eff, g_eff = optimize_bids_embedded(
             X,
             weights_dict,
             budget=args.budget,
-            max_bid=args.max_bid
+            max_bid=args.max_bid,
+            conv_model=conv_model,
+            clicks_model=clicks_model
         )
         
         # Extract solution
         if model.status == 2 or model.status == 9:  # OPTIMAL or TIME_LIMIT
             output_dir = Path('opt_results')
             output_dir.mkdir(exist_ok=True)
-            output_file = output_dir / f'optimized_bids_{args.embedding_method}.csv'
+            
+            model_suffix = f"{args.alg_conv}_{args.alg_clicks}"
+            output_file = output_dir / f'optimized_bids_{args.embedding_method}_{model_suffix}.csv'
             
             bids_df = extract_solution(model, b, z, y, f_eff, g_eff, keyword_df, kw_idx_list, region_list, match_list, X=X, weights_dict=weights_dict)
             
