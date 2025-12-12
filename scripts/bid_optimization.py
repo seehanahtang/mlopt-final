@@ -258,11 +258,17 @@ def extract_weights(lnr_conv, lnr_clicks, embedding_method='bert', n_embeddings=
     }
 
 
-def create_feature_matrix(keyword_df, embedding_method='bert', target_day=None, regions=None, match_types=None, training_data_path='clean_data/ad_opt_data_bert.csv', weights_dict=None):
-    """Create feature matrix for all keyword-region-match combinations for a specific day.
+def create_feature_matrix(keyword_df, embedding_method='bert', target_day=None, regions=None, match_types=None, training_data_path='clean_data/ad_opt_data_bert.csv', weights_dict=None, alg_conv='lr', alg_clicks='lr'):
+    """Create feature matrix/matrices for all keyword-region-match combinations for a specific day.
     
     Merges on exact keyword-match type-region combinations from historical data.
     If target_day is None, uses the latest date in data and adjusts date features for today.
+    
+    For mixed models (ORT + LR), returns two versions:
+    - X_ort: categorical features as strings (for ORT model access)
+    - X_lr: categorical features one-hot encoded (for LR model access)
+    
+    For single model type, returns the appropriate version as X.
     
     Includes:
     - Embeddings from keyword_df
@@ -279,6 +285,13 @@ def create_feature_matrix(keyword_df, embedding_method='bert', target_day=None, 
         match_types: list of match types (default: ["broad match", "exact match", "phrase match"])
         training_data_path: path to training data file
         weights_dict: dict with 'conv_weights' and 'clicks_weights' to filter features. If None, keeps all.
+        alg_conv: algorithm type for conversion model ('lr', 'ort', etc.).
+        alg_clicks: algorithm type for clicks model ('lr', 'ort', etc.).
+    
+    Returns:
+        For ORT-only: (X_ort, keyword_idx_list, region_list, match_list)
+        For LR-only: (X_lr, keyword_idx_list, region_list, match_list)
+        For mixed: (X_ort, X_lr, keyword_idx_list, region_list, match_list)
     """
     if regions is None:
         regions = ["USA", "A", "B", "C"]
@@ -389,19 +402,59 @@ def create_feature_matrix(keyword_df, embedding_method='bert', target_day=None, 
     # Convert column names: replace dots with underscores to match model feature names
     result.columns = result.columns.str.replace('.', '_', regex=False)
     
-    # One-hot encode categorical columns (if any)
-    categorical_cols = result.select_dtypes(include=['object']).columns.tolist()
-    if categorical_cols:
-        print(f"  One-hot encoding categorical columns: {categorical_cols}")
-        result = pd.get_dummies(result, columns=categorical_cols, drop_first=False)
+    # Determine if we need both versions (mixed models) or just one
+    use_ort_conv = (alg_conv == 'ort')
+    use_ort_clicks = (alg_clicks == 'ort')
+    use_both = use_ort_conv and use_ort_clicks
+    use_both_lr = (not use_ort_conv) and (not use_ort_clicks)
+    is_mixed = (use_ort_conv and not use_ort_clicks) or (not use_ort_conv and use_ort_clicks)
     
-    # Convert all columns to float for numeric operations
-    result = result.astype(float)
+    if use_both:
+        # Both ORT: keep categorical as strings only
+        print(f"  Keeping categorical features as strings (both models are ORT)")
+        numeric_cols = result.select_dtypes(include=[np.number]).columns.tolist()
+        for col in numeric_cols:
+            result[col] = result[col].astype(float)
+        X_ort = result
+        X_lr = None
+        
+    elif use_both_lr:
+        # Both LR: one-hot encode only
+        print(f"  One-hot encoding categorical columns (both models are LR)")
+        categorical_cols = result.select_dtypes(include=['object']).columns.tolist()
+        if categorical_cols:
+            result = pd.get_dummies(result, columns=categorical_cols, drop_first=False)
+        result = result.astype(float)
+        X_ort = None
+        X_lr = result
+        
+    else:
+        # Mixed models: create both versions
+        print(f"  Creating both versions for mixed models ({alg_conv.upper()} + {alg_clicks.upper()})")
+        
+        # Version 1: ORT (categorical as strings)
+        numeric_cols = result.select_dtypes(include=[np.number]).columns.tolist()
+        X_ort = result.copy()
+        for col in numeric_cols:
+            X_ort[col] = X_ort[col].astype(float)
+        
+        # Version 2: LR (one-hot encoded)
+        X_lr = result.copy()
+        categorical_cols = X_lr.select_dtypes(include=['object']).columns.tolist()
+        if categorical_cols:
+            X_lr = pd.get_dummies(X_lr, columns=categorical_cols, drop_first=False)
+        X_lr = X_lr.astype(float)
     
-    print(f"  Final feature matrix shape: {result.shape}")
-    print(f"  Columns: {result.columns.tolist()[:15]}...")
+    print(f"  Final feature matrix shape: {(X_ort if X_ort is not None else X_lr).shape}")
+    print(f"  Columns: {(X_ort if X_ort is not None else X_lr).columns.tolist()[:15]}...")
     
-    return result, keyword_idx_list, region_list, match_list
+    # Return appropriate format
+    if is_mixed:
+        return X_ort, X_lr, keyword_idx_list, region_list, match_list
+    elif use_both:
+        return X_ort, keyword_idx_list, region_list, match_list
+    else:  # use_both_lr
+        return X_lr, keyword_idx_list, region_list, match_list
 
 
 def optimize_bids(X, weights_dict, budget=68096.51, max_bid=100, n_active=14229):
@@ -571,10 +624,11 @@ def embed_lr(model, weights, const, X, b, target):
     
     return model, pred_vars
 
-def embed_ort(model, ort_model, X, b, target, M=1e5, save_dir=None):
+def embed_ort(model, ort_model, X, b, target, max_bid=50.0, M=None, save_dir=None):
     """
-    Embeds Optimal Regression Tree (ORT) constraints directly into Gurobi model.
-    Creates prediction variables and leaf indicator variables, linking them to features and bids.
+    Embeds Optimal Regression Tree (ORT) constraints directly into Gurobi model using path-based formulation.
+    Path-based formulation enforces all split conditions along the path to each leaf (OptiCL-style).
+    For each leaf, creates multiple constraints (one per split node on path).
     
     Args:
         model: Gurobi model object
@@ -582,7 +636,8 @@ def embed_ort(model, ort_model, X, b, target, M=1e5, save_dir=None):
         X: Feature matrix (pandas DataFrame)
         b: Bid decision variables (Gurobi MVar)
         target: Target name ('conversion' or 'clicks') for variable naming
-        M: Big-M parameter for indicator constraints (default: 1e5)
+        max_bid: Maximum individual bid (used for M calculation) (default: 50.0)
+        M: Big-M parameter for indicator constraints. If None, automatically calculated from data.
         save_dir: (Optional) Directory to save the tree visualization HTML. If None, no save.
 
     Returns:
@@ -591,12 +646,12 @@ def embed_ort(model, ort_model, X, b, target, M=1e5, save_dir=None):
     K = len(X)
     pred_vars = []
     
-    print(f"  Embedding {target} ORT model constraints...")
+    print(f"  Embedding {target} ORT model constraints (path-based formulation)...")
     
     # Save tree visualization if requested
     if save_dir is not None:
         save_dir = Path(save_dir)
-        save_dir.mkdir(exist_ok=True)
+        save_dir.mkdir(exist_ok=True, parents=True)
         tree_file = save_dir / f'{target}_tree.html'
         ort_model.write_html(str(tree_file))
         print(f"    Saved {target} tree visualization to {tree_file}")
@@ -617,7 +672,120 @@ def embed_ort(model, ort_model, X, b, target, M=1e5, save_dir=None):
     for leaf_idx in leaf_nodes:
         leaf_predictions[leaf_idx] = ort_model.get_regression_constant(node_index=leaf_idx)
     
-    # Create prediction variables for each row (output of tree)
+    # Build path map: for each leaf, get all nodes on path from root
+    def get_path_to_leaf(leaf_idx, ort_model):
+        """Get list of (node_idx, direction) tuples on path from root to leaf.
+        direction: 'lower' if node is on lower branch, 'upper' if on upper branch."""
+        path = []
+        current = leaf_idx
+        
+        while current != 1:  # 1 is root
+            parent = ort_model.get_parent(node_index=current)
+            lower_child = ort_model.get_lower_child(node_index=parent)
+            
+            if lower_child == current:
+                path.append((parent, 'lower'))
+            else:
+                path.append((parent, 'upper'))
+            
+            current = parent
+        
+        return list(reversed(path))  # Return path from root to leaf
+    
+    # Precompute paths for all leaves
+    leaf_paths = {leaf_id: get_path_to_leaf(leaf_id, ort_model) for leaf_id in leaf_nodes}
+    
+    # --- Calculate Big-M automatically if not provided ---
+    if M is None:
+        print(f"    Calculating principled Big-M (data-driven + bid contribution)...")
+        max_feature_diff = 0.0
+        max_bid_coeff = 0.0
+        
+        # Iterate through all split nodes to compute max deviations
+        for node_idx in range(1, num_nodes + 1):
+            if ort_model.is_leaf(node_index=node_idx):
+                continue  # Skip leaf nodes
+            
+            # First, try to get split feature
+            try:
+                split_feature = ort_model.get_split_feature(node_index=node_idx)
+            except Exception as e:
+                print(f"      Warning: Skipping node {node_idx} (could not get split feature)")
+                continue
+            
+            # Check if this is a hyperplane split
+            try:
+                is_hyperplane = ort_model.is_hyperplane_split(node_index=node_idx)
+            except Exception as e:
+                print(f"      Warning: Skipping node {node_idx} (could not determine split type)")
+                continue
+            
+            # Try to get threshold first (for numeric/axis-aligned splits)
+            try:
+                split_threshold = ort_model.get_split_threshold(node_index=node_idx)
+            except Exception as e:
+                # No threshold - might be categorical, try to get categories
+                try:
+                    split_cats = ort_model.get_split_categories(node_index=node_idx)
+                    # It's categorical, skip M calculation
+                    continue
+                except Exception as e2:
+                    print(f"      Warning: Skipping node {node_idx} (could not get threshold or categories)")
+                    continue
+            
+            if is_hyperplane:
+                # Hyperplane split: weighted combination of features
+                try:
+                    weights_dict = ort_model.get_split_weights(node_index=node_idx)[0]
+                except Exception as e:
+                    print(f"      Warning: Could not extract weights for node {node_idx}")
+                    continue
+                
+                # Compute max feature-based deviation (excluding bid terms)
+                for i in range(K):
+                    try:
+                        split_expr = 0.0
+                        bid_weight = 0.0
+                        
+                        for feat_name, weight in weights_dict.items():
+                            if feat_name in ['Avg. CPC', 'Avg_ CPC']:
+                                bid_weight = abs(weight)
+                            else:
+                                if feat_name in X.columns:
+                                    split_expr += weight * X.iloc[i][feat_name]
+                        
+                        # Update max feature difference and max bid coefficient
+                        feature_diff = abs(split_expr - split_threshold)
+                        max_feature_diff = max(max_feature_diff, feature_diff)
+                        max_bid_coeff = max(max_bid_coeff, bid_weight)
+                    except Exception as e:
+                        print(f"      Warning: Error computing split expr for node {node_idx}, row {i}")
+                        continue
+            else:
+                # Axis-aligned split: single feature vs threshold
+                for i in range(K):
+                    try:
+                        if split_feature in ['Avg. CPC', 'Avg_ CPC']:
+                            # Pure bid term: coefficient is implicitly 1.0 when feature is b[i]
+                            max_bid_coeff = max(max_bid_coeff, 1.0)
+                        else:
+                            if split_feature in X.columns:
+                                split_expr = X.iloc[i][split_feature]
+                                diff = abs(split_expr - split_threshold)
+                                max_feature_diff = max(max_feature_diff, diff)
+                    except Exception as e:
+                        print(f"      Warning: Error processing feature {split_feature} for node {node_idx}, row {i}")
+                        continue
+        
+        # Principled M: account for both feature deviations and maximum bid contribution
+        # M = max_feature_diff + max_bid_coeff * max_bid
+        M = max_feature_diff + max_bid_coeff * max_bid
+        print(f"    Calculated Big-M = {M:.4f}")
+        print(f"      (max feature diff: {max_feature_diff:.4f}, max bid coeff: {max_bid_coeff:.4f}, max_bid: {max_bid:.2f})")
+    else:
+        print(f"    Using provided Big-M = {M:.4f}")
+    
+    # Create prediction variables for each row
     # Also create leaf indicator variables: l[i, leaf_id] = 1 if row i reaches leaf_id
     for i in range(K):
         pred_var = model.addVar(lb=-GRB.INFINITY, name=f'{target}_pred_{i}')
@@ -634,61 +802,106 @@ def embed_ort(model, ort_model, X, b, target, M=1e5, save_dir=None):
             name=f'{target}_one_leaf_{i}'
         )
         
-        # Add path constraints from root to leaves
-        # For each node, add constraint: if on this path, feature must satisfy split condition
-        for node_idx in range(1, num_nodes + 1):
-            if ort_model.is_leaf(node_index=node_idx):
-                continue  # Skip leaf nodes, no split
+        # Path-based constraints: for each leaf, add constraints for all splits on its path
+        for leaf_id in leaf_nodes:
+            path_to_leaf = leaf_paths[leaf_id]
             
-            # Get split information
-            split_feature = ort_model.get_split_feature(node_index=node_idx)
-            split_threshold = ort_model.get_split_threshold(node_index=node_idx)
-            lower_child = ort_model.get_lower_child(node_index=node_idx)
-            upper_child = ort_model.get_upper_child(node_index=node_idx)
-            
-            # Check if split is a hyperplane (weighted combination) or axis-aligned
-            is_hyperplane = ort_model.is_hyperplane_split(node_index=node_idx)
-            
-            if is_hyperplane:
-                # Hyperplane split: weighted combination of features
-                weights_dict = ort_model.get_split_weights(node_index=node_idx)[0]
+            # For each split node on the path to this leaf
+            for node_idx, direction in path_to_leaf:
+                # Get split feature first
+                try:
+                    split_feature = ort_model.get_split_feature(node_index=node_idx)
+                except Exception as e:
+                    print(f"    Warning: Skipping path constraint for node {node_idx} (could not get split feature)")
+                    continue
                 
-                # Build expression: sum(weights[feat] * X[i, feat])
-                split_expr = 0
-                for feat_name, weight in weights_dict.items():
-                    # Handle CPC weight specially - use decision variable b instead of feature matrix
-                    if feat_name in ['Avg. CPC', 'Avg_ CPC']:
-                        split_expr += weight * b[i]
+                # Check if this is a hyperplane split
+                try:
+                    is_hyperplane = ort_model.is_hyperplane_split(node_index=node_idx)
+                except Exception as e:
+                    print(f"    Warning: Skipping path constraint for node {node_idx} (could not determine split type)")
+                    continue
+                
+                # Try to get threshold first (for numeric/axis-aligned and hyperplane splits)
+                try:
+                    split_threshold = ort_model.get_split_threshold(node_index=node_idx)
+                except Exception as e:
+                    # No threshold - try categorical
+                    try:
+                        split_cats = ort_model.get_split_categories(node_index=node_idx)
+                    except Exception as e2:
+                        print(f"    Warning: Skipping path constraint for node {node_idx} (could not get threshold or categories)")
+                        continue
+                    
+                    # Categorical split: check if feature value is in the right category set
+                    # split_cats is like {'USA': True, 'B': False, 'A': True, 'C': False}
+                    # direction='lower' means feature should be in True categories, 'upper' means False
+                    if direction == 'lower':
+                        true_cats = {cat for cat, goes_lower in split_cats.items() if goes_lower}
                     else:
-                        if feat_name not in X.columns:
-                            raise ValueError(f"Feature '{feat_name}' not found in X for {target} ORT model")
-                        split_expr += weight * X.iloc[i][feat_name]
-            else:
-                # Axis-aligned split: single feature vs threshold
-                if split_feature in ['Avg. CPC', 'Avg_ CPC']:
-                    split_expr = b[i]
-                else:
+                        true_cats = {cat for cat, goes_lower in split_cats.items() if not goes_lower}
+                    
                     if split_feature not in X.columns:
                         raise ValueError(f"Feature '{split_feature}' not found in X for {target} ORT model")
-                    split_expr = X.iloc[i][split_feature]
-            
-            # For leaves reachable via lower_child (feature <= threshold):
-            # Add constraint that if we're in a leaf reachable via lower_child, then split_expr <= threshold
-            lower_leaves = _get_descendant_leaves(lower_child, ort_model, leaf_nodes)
-            if lower_leaves:
-                model.addConstr(
-                    split_expr <= split_threshold + M * (1 - gp.quicksum(leaf_indicators[leaf_id] for leaf_id in lower_leaves)),
-                    name=f'{target}_lower_split_{i}_{node_idx}'
-                )
-            
-            # For leaves reachable via upper_child (feature > threshold):
-            # Add constraint that if we're in a leaf reachable via upper_child, then split_expr > threshold
-            upper_leaves = _get_descendant_leaves(upper_child, ort_model, leaf_nodes)
-            if upper_leaves:
-                model.addConstr(
-                    split_expr >= split_threshold + 1e-6 - M * (1 - gp.quicksum(leaf_indicators[leaf_id] for leaf_id in upper_leaves)),
-                    name=f'{target}_upper_split_{i}_{node_idx}'
-                )
+                    
+                    # Create binary indicator: 1 if feature value is in true_cats, 0 otherwise
+                    cat_indicator = model.addVar(vtype=GRB.BINARY, name=f'{target}_cat_{i}_{leaf_id}_{node_idx}')
+                    
+                    # Constraint: cat_indicator = 1 iff X[i, split_feature] in true_cats
+                    feature_val = str(X.iloc[i][split_feature])
+                    is_in_true_cats = 1 if feature_val in true_cats else 0
+                    model.addConstr(cat_indicator == is_in_true_cats, name=f'{target}_cat_constr_{i}_{leaf_id}_{node_idx}')
+                    
+                    # Path constraint: if leaf is active, cat_indicator must be 1
+                    model.addConstr(cat_indicator >= 1 - M * (1 - leaf_indicators[leaf_id]), 
+                                   name=f'{target}_path_cat_{i}_{leaf_id}_{node_idx}')
+                    continue
+                
+                # Build list of expression terms (will be combined with gp.quicksum for proper Gurobi expression handling)
+                expr_terms = []
+                
+                if is_hyperplane:
+                    # Hyperplane split: weighted combination of features
+                    try:
+                        weights_dict = ort_model.get_split_weights(node_index=node_idx)[0]
+                    except Exception as e:
+                        print(f"    Warning: Could not extract weights for node {node_idx}")
+                        continue
+                    
+                    # Build expression: sum(weights[feat] * X[i, feat])
+                    for feat_name, weight in weights_dict.items():
+                        # Handle CPC weight specially - use decision variable b instead of feature matrix
+                        if feat_name in ['Avg. CPC', 'Avg_ CPC']:
+                            expr_terms.append(weight * b[i])
+                        else:
+                            if feat_name not in X.columns:
+                                raise ValueError(f"Feature '{feat_name}' not found in X for {target} ORT model")
+                            expr_terms.append(weight * X.iloc[i][feat_name])
+                else:
+                    # Axis-aligned split: single feature vs threshold
+                    if split_feature in ['Avg. CPC', 'Avg_ CPC']:
+                        expr_terms.append(b[i])
+                    else:
+                        if split_feature not in X.columns:
+                            raise ValueError(f"Feature '{split_feature}' not found in X for {target} ORT model")
+                        expr_terms.append(X.iloc[i][split_feature])
+                
+                # Use gp.quicksum to build proper Gurobi expression (handles both constants and variables)
+                split_expr = gp.quicksum(expr_terms) if expr_terms else 0.0
+                
+                # Add constraint based on direction of split on path
+                if direction == 'lower':
+                    # If this leaf is activated, split_expr must be <= threshold
+                    model.addConstr(
+                        split_expr <= split_threshold + M * (1 - leaf_indicators[leaf_id]),
+                        name=f'{target}_path_lower_{i}_{leaf_id}_{node_idx}'
+                    )
+                else:  # direction == 'upper'
+                    # If this leaf is activated, split_expr must be > threshold
+                    model.addConstr(
+                        split_expr >= split_threshold + 1e-6 - M * (1 - leaf_indicators[leaf_id]),
+                        name=f'{target}_path_upper_{i}_{leaf_id}_{node_idx}'
+                    )
         
         # Link prediction variable to leaf predictions
         # pred_var = sum(leaf_predictions[leaf] * leaf_indicator[leaf])
@@ -729,7 +942,7 @@ def _get_descendant_leaves(node_idx, ort_model, all_leaves):
     
     return descendants
 
-def optimize_bids_embedded(X, weights_dict, budget=400, max_bid=50.0, conv_model=None, clicks_model=None):
+def optimize_bids_embedded(X_ort=None, X_lr=None, weights_dict=None, budget=400, max_bid=50.0, conv_model=None, clicks_model=None):
     """Solve bid optimization problem using Gurobi with embedded ML model constraints.
     
     Supports embedding of:
@@ -740,7 +953,8 @@ def optimize_bids_embedded(X, weights_dict, budget=400, max_bid=50.0, conv_model
     while preserving the ability for y=0 to force results to 0.
     
     Args:
-        X: Feature matrix
+        X_ort: Feature matrix with categorical features as strings (for ORT models). If None, will use X_lr.
+        X_lr: Feature matrix with categorical features one-hot encoded (for LR models). If None, will use X_ort.
         weights_dict: Dictionary with 'conv_const', 'conv_weights', 'clicks_const', 'clicks_weights'
         budget: Total budget for bids
         max_bid: Maximum individual bid
@@ -755,11 +969,17 @@ def optimize_bids_embedded(X, weights_dict, budget=400, max_bid=50.0, conv_model
     # Big-M parameters must be upper bounds on the maximum possible values
     M_d = 400     # Max potential clicks (Big-M for g)
     M_c = 40000   # Max potential conversion value (Big-M for f)
-    K = len(X)    # Number of items
-
+    
     # Determine which models are being used
     use_ort_conv = conv_model is not None
     use_ort_clicks = clicks_model is not None
+    
+    # Select appropriate X for each model
+    X_conv = X_ort if use_ort_conv else X_lr
+    X_clicks = X_ort if use_ort_clicks else X_lr
+    
+    # Use whichever X is not None for size reference
+    K = len(X_ort) if X_ort is not None else len(X_lr)
     
     model_type_str = ""
     if use_ort_conv or use_ort_clicks:
@@ -805,27 +1025,27 @@ def optimize_bids_embedded(X, weights_dict, budget=400, max_bid=50.0, conv_model
     g_hat_vars = []
     
     # Create trees directory for ORT visualization
-    trees_dir = Path('ort_trees') if (use_ort_conv or use_ort_clicks) else None
+    trees_dir = Path('opt_results/trees') if (use_ort_conv or use_ort_clicks) else None
     
     # Embed conversion model
     if use_ort_conv:
         # Use ORT model
-        model, f_hat_vars = embed_ort(model, conv_model, X, b, target='conversion', save_dir=trees_dir)
+        model, f_hat_vars = embed_ort(model, conv_model, X_conv, b, target='conversion', max_bid=max_bid, save_dir=trees_dir)
     else:
         # Use LR model
         conv_const = weights_dict['conv_const']
         conv_weights = weights_dict['conv_weights']
-        model, f_hat_vars = embed_lr(model, conv_weights, conv_const, X, b, target='conversion')
+        model, f_hat_vars = embed_lr(model, conv_weights, conv_const, X_conv, b, target='conversion')
     
     # Embed clicks model
     if use_ort_clicks:
         # Use ORT model
-        model, g_hat_vars = embed_ort(model, clicks_model, X, b, target='clicks', save_dir=trees_dir)
+        model, g_hat_vars = embed_ort(model, clicks_model, X_clicks, b, target='clicks', max_bid=max_bid, save_dir=trees_dir)
     else:
         # Use LR model
         clicks_const = weights_dict['clicks_const']
         clicks_weights = weights_dict['clicks_weights']
-        model, g_hat_vars = embed_lr(model, clicks_weights, clicks_const, X, b, target='clicks')
+        model, g_hat_vars = embed_lr(model, clicks_weights, clicks_const, X_clicks, b, target='clicks')
     
     model.update()
     
@@ -880,8 +1100,8 @@ def optimize_bids_embedded(X, weights_dict, budget=400, max_bid=50.0, conv_model
     model.setObjective(total_revenue - total_cost, GRB.MAXIMIZE)
 
     # --- Save Model Formulation ---
-    model_dir = Path('model_formulations')
-    model_dir.mkdir(exist_ok=True)
+    model_dir = Path('opt_results/formulations')
+    model_dir.mkdir(exist_ok=True, parents=True)
     
     model.update()
     
@@ -968,7 +1188,7 @@ def main():
     parser.add_argument(
         '--alg-conv',
         type=str,
-        default='lr',# 'ort',#
+        default='ort',#'lr',# 
         choices=['lr', 'ort', 'rf', 'xgb'],
         help='Algorithm type for conversion model: lr (linear regression), ort (optimal tree), rf (random forest), xgb (xgboost) (default: lr)'
     )
@@ -1032,15 +1252,51 @@ def main():
         
         # Create feature matrix (includes all features and keyword values for target day)
         training_data_file = Path(args.data_dir) / f'ad_opt_data_{args.embedding_method}.csv'
-        X, kw_idx_list, region_list, match_list = create_feature_matrix(
+        feature_matrix_result = create_feature_matrix(
             keyword_df, 
             embedding_method=args.embedding_method,
             target_day=args.target_day,
             training_data_path=str(training_data_file),
-            weights_dict=weights_dict
+            weights_dict=weights_dict,
+            alg_conv=args.alg_conv,
+            alg_clicks=args.alg_clicks
         )
         
+        # Unpack results based on model types
+        is_mixed = (args.alg_conv == 'ort' and args.alg_clicks != 'ort') or (args.alg_conv != 'ort' and args.alg_clicks == 'ort')
+        if is_mixed:
+            X_ort, X_lr, kw_idx_list, region_list, match_list = feature_matrix_result
+        else:
+            X_result, kw_idx_list, region_list, match_list = feature_matrix_result
+            X_ort = X_result if args.alg_conv == 'ort' and args.alg_clicks == 'ort' else None
+            X_lr = X_result if args.alg_conv != 'ort' and args.alg_clicks != 'ort' else None
+        
+        X = X_ort if X_ort is not None else X_lr
         print(f"Feature matrix has {X.shape[1]} total features")
+        
+        # Save feature matrices
+        data_dir = Path('opt_results/feature_matrices')
+        data_dir.mkdir(exist_ok=True, parents=True)
+        
+        if X_ort is not None:
+            ort_file = data_dir / f'X_ort_{args.embedding_method}_{args.alg_conv}_{args.alg_clicks}.csv'
+            X_ort.to_csv(ort_file, index=False)
+            print(f"Saved X_ort to {ort_file}")
+        
+        if X_lr is not None:
+            lr_file = data_dir / f'X_lr_{args.embedding_method}_{args.alg_conv}_{args.alg_clicks}.csv'
+            X_lr.to_csv(lr_file, index=False)
+            print(f"Saved X_lr to {lr_file}")
+        
+        # Also save the mapping information (keyword indices, regions, match types)
+        mapping_file = data_dir / f'mapping_{args.embedding_method}_{args.alg_conv}_{args.alg_clicks}.csv'
+        mapping_df = pd.DataFrame({
+            'keyword_idx': kw_idx_list,
+            'region': region_list,
+            'match_type': match_list
+        })
+        mapping_df.to_csv(mapping_file, index=False)
+        print(f"Saved mapping to {mapping_file}")
 
         # Load ORT models if requested for specific targets
         conv_model = None
@@ -1068,8 +1324,9 @@ def main():
 
         # Optimize using embedded ML constraints
         model, b, z, y, f_eff, g_eff = optimize_bids_embedded(
-            X,
-            weights_dict,
+            X_ort=X_ort,
+            X_lr=X_lr,
+            weights_dict=weights_dict,
             budget=args.budget,
             max_bid=args.max_bid,
             conv_model=conv_model,
@@ -1078,8 +1335,8 @@ def main():
         
         # Extract solution
         if model.status == 2 or model.status == 9:  # OPTIMAL or TIME_LIMIT
-            output_dir = Path('opt_results')
-            output_dir.mkdir(exist_ok=True)
+            output_dir = Path('opt_results/bids')
+            output_dir.mkdir(exist_ok=True, parents=True)
             
             model_suffix = f"{args.alg_conv}_{args.alg_clicks}"
             output_file = output_dir / f'optimized_bids_{args.embedding_method}_{model_suffix}.csv'
